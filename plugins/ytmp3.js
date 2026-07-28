@@ -1,170 +1,99 @@
 /*
-- YouTube MP3 Downloader Plugin
-- Adapted from SoyMaycol's scraper to fit the bot's handler architecture
+  Source: t.ms/IkyyExecutive
+  RestApi: api.ikyyxd.my.id
+  Note: Uses the ssvid.cc backend via convert1s.com — reasonably fast
 */
 
-import crypto from 'crypto'
+import axios from 'axios'
 
-const BASE_URL = 'https://embed.dlsrv.online'
+const YT_REGEX = /(?:youtube\.com\/(?:watch\?v=|shorts\/|live\/)|youtu\.be\/)([\w-]{11})/
 
-class YTDL {
-  constructor() {
-    this.headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Origin': BASE_URL,
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-origin',
-      'Priority': 'u=1,i'
-    }
-  }
+async function ytmp3(ytUrl) {
+	const headers = {
+		'accept': 'application/json',
+		'content-type': 'application/json',
+		'origin': 'https://ssvid.cc',
+		'referer': 'https://ssvid.cc/',
+		'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36',
+	}
 
-  getVideoId(url) {
-    const match = url.match(/(?:v=|youtu\.be\/|shorts\/)([A-Za-z0-9_-]{11})/)
-    if (!match) throw new Error('Invalid YouTube URL, could not extract video ID')
-    return match[1]
-  }
+	const initRes = await axios.post('https://hub.convert1s.com/api/download', {
+		url: ytUrl,
+		audio: { bitrate: '128k' },
+		output: { type: 'audio', format: 'mp3' },
+	}, { headers })
 
-  sha256(str) {
-    return crypto.createHash('sha256').update(str).digest('hex')
-  }
+	const { statusUrl, title, duration } = initRes.data
 
-  hmac(key, data) {
-    return crypto.createHmac('sha256', key).update(data).digest('hex')
-  }
+	if (!statusUrl) {
+		throw new Error('Failed to get statusUrl from server.')
+	}
 
-  buildFingerprint() {
-    const d = {
-      ua: this.headers['User-Agent'],
-      lang: 'en-US',
-      langs: 'en-US,en',
-      screen: { w: 1920, h: 1080, cd: 24 },
-      tzOffset: '-300',
-      tz: 'America/New_York',
-      hc: '12',
-      dm: '8',
-      chrome: 'true',
-      canvasHash: '',
-      webdriver: 'false',
-      gpu: '',
-      gpuVendor: ''
-    }
-    const fp = this.sha256([
-      d.ua, d.lang, d.langs,
-      `${d.screen.w}x${d.screen.h}x${d.screen.cd}`,
-      d.tzOffset, d.tz, d.hc, d.dm, d.chrome, d.canvasHash
-    ].join('|'))
-    return { fp, d }
-  }
+	let downloadData = null
+	const maxAttempts = 20 // ~30s ceiling so a stuck job can't hang the handler forever
+	let attempts = 0
 
-  async solveChallenge(ch) {
-    let n = 0n
-    const prefix = '0'.repeat(ch.difficulty)
-    while (!this.sha256(`${ch.salt}:${ch.ts}:${n}`).startsWith(prefix)) n++
-    return n.toString()
-  }
+	while (!downloadData) {
+		if (++attempts > maxAttempts) {
+			throw new Error('Conversion timed out, please try again.')
+		}
 
-  async download(url) {
-    const format = 'mp3'
-    const quality = '320'
-    const id = this.getVideoId(url)
-    const headers = {
-      ...this.headers,
-      Referer: `${BASE_URL}/v1/full?videoId=${id}`
-    }
+		const statusRes = await axios.get(statusUrl, { headers })
 
-    // Step 1: get the init token from the embed page
-    const page = await (await fetch(`${BASE_URL}/v1/full?videoId=${id}`, { headers })).text()
-    const tokenMatch = page.match(/data-token="([^"]+)"/)
-    if (!tokenMatch) throw new Error('Failed to fetch init token, the service may be down')
-    const initToken = tokenMatch[1]
+		if (statusRes.data.status === 'completed') {
+			downloadData = statusRes.data
+		} else if (statusRes.data.status === 'error' || statusRes.data.status === 'failed') {
+			throw new Error('Conversion failed on the server side.')
+		} else {
+			await new Promise(resolve => setTimeout(resolve, 1500))
+		}
+	}
 
-    // Step 2: fetch a proof-of-work challenge
-    const challenge = await (await fetch(`${BASE_URL}/api/challenge`, { method: 'POST', headers })).json()
+	if (!downloadData.downloadUrl) {
+		throw new Error('No downloadUrl returned by the server.')
+	}
 
-    // Step 3: solve the challenge and verify
-    const nonce = await this.solveChallenge(challenge)
-    const { fp, d } = this.buildFingerprint()
-
-    const verify = await (await fetch(`${BASE_URL}/api/verify`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        initToken,
-        fpHash: fp,
-        fpDetails: d,
-        salt: challenge.salt,
-        ts: challenge.ts,
-        signature: challenge.signature,
-        nonce,
-        telemetry: { interactions: 10, timeToVerify: 5000 }
-      })
-    })).json()
-
-    if (!verify?.token) throw new Error('Verification failed, could not get access token')
-
-    // Step 4: request the actual download link
-    const ts = Date.now().toString()
-    const sig = this.hmac(verify.token.slice(-32), `${ts}:${id}`)
-
-    const result = await (await fetch(`${BASE_URL}/api/download/mp3`, {
-      method: 'POST',
-      headers: {
-        ...headers,
-        Authorization: `Bearer ${verify.token}`,
-        'x-fp': fp,
-        'x-ts': ts,
-        'x-sig': sig
-      },
-      body: JSON.stringify({ videoId: id, format, quality })
-    })).json()
-
-    if (!result?.url) throw new Error('Failed to get download link from server')
-
-    return { ...result, videoId: id, format, quality }
-  }
+	return {
+		title: downloadData.title || title,
+		duration: downloadData.duration || duration,
+		downloadUrl: downloadData.downloadUrl,
+	}
 }
 
-const ytdl = new YTDL()
+const handler = async (m, { conn, usedPrefix, command, args }) => {
+	const url = args[0]
 
-let handler = async (m, { conn, text }) => {
-  if (!text) {
-    const guide = `*『 YOUTUBE MP3 DOWNLOADER 』*
+	if (!url || !YT_REGEX.test(url)) {
+		return conn.reply(m.chat,
+			`📥 *YouTube MP3 Downloader*\n\n` +
+			`Downloads the audio from a YouTube video as an MP3 file.\n\n` +
+			`*How to use:*\n` +
+			`${usedPrefix}${command} <youtube link>\n\n` +
+			`*Example:*\n` +
+			`${usedPrefix}${command} https://youtu.be/NJMEtaDTVtA\n\n` +
+			`Supports youtube.com, youtu.be, YouTube Shorts, and live links.`,
+			false, m
+		)
+	}
 
-Download audio from YouTube straight into this chat.
+	try {
+		await m.react('⏳')
 
-*How to use:*
-> .ytmp3 <YouTube URL>
+		const result = await ytmp3(url)
 
-*Example:*
-> .ytmp3 https://youtu.be/iSctNMm1XdA
+		await conn.sendMessage(m.chat, {
+			audio: { url: result.downloadUrl },
+			mimetype: 'audio/mpeg',
+			fileName: `${result.title || 'audio'}.mp3`,
+			ptt: false,
+		}, { quoted: m })
 
-Supported link formats:
-youtube.com/watch?v=..., youtu.be/..., youtube.com/shorts/...`
-
-    return conn.sendMessage(m.chat, { text: guide }, { quoted: m })
-  }
-
-  try {
-    await conn.sendMessage(m.chat, { react: { text: '⏳', key: m.key } })
-
-    const result = await ytdl.download(text.trim())
-
-    await conn.sendMessage(m.chat, {
-      audio: { url: result.url },
-      mimetype: 'audio/mpeg',
-      fileName: `${result.videoId}.mp3`,
-      ptt: false
-    }, { quoted: m })
-
-    await conn.sendMessage(m.chat, { react: { text: '✅', key: m.key } })
-  } catch (e) {
-    await conn.sendMessage(m.chat, { react: { text: '❌', key: m.key } })
-    await conn.sendMessage(m.chat, { text: `Failed to download: ${e.message}` }, { quoted: m })
-  }
+		await m.react('✅')
+	} catch (e) {
+		console.error('ytmp3 error:', e.message)
+		await m.react('❌')
+		m.reply(`Failed to download audio: ${e.message}`)
+	}
 }
 
 handler.help = handler.command = ['ytmp3']
